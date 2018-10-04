@@ -2,11 +2,13 @@
 {
     using Microsoft.Extensions.CommandLineUtils;
     using System;
+    using System.Collections.Generic;
     using System.Diagnostics;
     using System.Globalization;
     using System.IO;
     using System.Linq;
     using System.Reflection;
+    using System.Security.Principal;
 
     /// <summary>
     /// The application entry point class.
@@ -14,6 +16,23 @@
     internal static class Program
     {
         private static double GetPercentage(int actual, int maximum) => Math.Round(((double)100 / maximum) * actual, 1);
+
+
+        public class AssocPassHash
+        {
+            public string hash;
+            public string pass;
+            public int count;
+            public int len;
+
+            public AssocPassHash(string pHash, string pPass, int pLen)
+            {
+                this.count = 0;
+                this.hash = pHash;
+                this.pass = pPass;
+                this.len = pLen;
+            }
+        };
 
         [Conditional("DEBUG")]
         private static void LaunchDebugger()
@@ -51,6 +70,7 @@ Sensitive information will be stored in memory and on disk. Ensure the pwdump fi
             var wordlistPath = commandLineApplication.Option("--wordlist", "The path to a wordlist of weak passwords for basic hash cracking. Warning, using this option is slow, the use of a dedicated password cracker, such as 'john', is recommended instead.", CommandOptionType.SingleValue);
             var baseDate = commandLineApplication.Option("--base-date <yyyyMMdd>", "Specifies a custom date to be used as the base date in statistics. The last modified date of the NTDS file is used by default.", CommandOptionType.SingleValue);
             var debug = commandLineApplication.Option("--debug", "Show debug output.", CommandOptionType.NoValue);
+            var potFile = commandLineApplication.Option("--potfile <file>", "The path of hashcat potfile in pwdump format.", CommandOptionType.SingleValue);
 
             commandLineApplication.OnExecute(() =>
             {
@@ -123,7 +143,7 @@ Sensitive information will be stored in memory and on disk. Ensure the pwdump fi
 
                 if (!showHelp && argumentsValid)
                 {
-                    var ntdsAudit = new NtdsAudit(ntdsPath.Value, pwdumpPath.HasValue(), includeHistoryHashes.HasValue(), systemHivePath.Value(), wordlistPath.Value());
+                    var ntdsAudit = new NtdsAudit(ntdsPath.Value, true, includeHistoryHashes.HasValue(), systemHivePath.Value(), wordlistPath.Value());
 
                     var baseDateTime = baseDate.HasValue() ? DateTime.ParseExact(baseDate.Value(), "yyyyMMdd", null, DateTimeStyles.AssumeUniversal) : new FileInfo(ntdsPath.Value).LastWriteTimeUtc;
 
@@ -136,7 +156,7 @@ Sensitive information will be stored in memory and on disk. Ensure the pwdump fi
 
                     if (usersCsvPath.HasValue())
                     {
-                        WriteUsersCsvFile(usersCsvPath.Value(), ntdsAudit, baseDateTime);
+                        WriteUsersCsvFile(usersCsvPath.Value(), ntdsAudit, baseDateTime, potFile.Value());
                     }
 
                     if (computersCsvPath.HasValue())
@@ -166,7 +186,7 @@ Sensitive information will be stored in memory and on disk. Ensure the pwdump fi
 
             foreach (var domain in ntdsAudit.Domains)
             {
-                Console.WriteLine($"Account stats for: {domain.Fqdn}");
+                Console.WriteLine($"Account stats for: {domain.Fqdn} ({domain.Sid})");
 
                 var users = ntdsAudit.Users.Where(x => x.DomainSid.Equals(domain.Sid)).ToList();
                 var totalUsersCount = users.Count;
@@ -345,17 +365,198 @@ Sensitive information will be stored in memory and on disk. Ensure the pwdump fi
             Console.Write(Environment.NewLine);
         }
 
-        private static void WriteUsersCsvFile(string usersCsvPath, NtdsAudit ntdsAudit, DateTime baseDateTime)
+        private static string GetCSVStatistic(string statistic, int actual, int maximum)
         {
+            string ret= $"\"{statistic}\",\"";
+            var percentageString = (maximum < 1) ? "N/A" : GetPercentage(actual, maximum) + "%";
+            ret += $"{actual.ToString().PadLeft(5)} of {maximum.ToString().PadLeft(5)} ({percentageString})\"";
+            return ret;
+        }
+
+
+        private static void WriteUsersCsvFile(string usersCsvPath, NtdsAudit ntdsAudit, DateTime baseDateTime, string potFile)
+        {
+            int nbUsers = ntdsAudit.Users.Length;
+            Console.WriteLine($"[*] Extracting {nbUsers} users...");
+            var progress = new ProgressBar("Performing users extraction...");
+
+            // Buffer des group
+            Dictionary<string, string> groupAssoc = new Dictionary<string, string>();
+            foreach (var group in ntdsAudit.Groups)
+            {
+                try {
+                    groupAssoc.Add(group.Sid.ToString(), group.Name);
+                }
+                catch
+                {
+                    if (groupAssoc[group.Sid.ToString()] != group.Name)
+                    {
+                        Console.WriteLine($"[*] Double SID with different name ! {group.Sid.ToString()} => \"{group.Name}\" and \"{groupAssoc[group.Sid.ToString()]}\"");
+                    }
+                }
+            }
+
+            // Buffer des hash
+            Console.WriteLine($"[*] Reading potfile potFile={potFile}");
+            Dictionary<string, string> hashAssoc = new Dictionary<string, string>();
+            if( File.Exists(potFile) )
+            {
+                using (var file = new StreamReader(potFile))
+                {
+                    string line;
+                    while ((line = file.ReadLine()) != null)
+                    {
+                        if (line.Length == 33)
+                        {
+                            hashAssoc.Add(line.Substring(0, 32), string.Empty);
+                        }
+                        else
+                        {
+                            try
+                            {
+                                hashAssoc.Add(line.Substring(0, 32).ToLower(), line.Substring(33));
+                            }
+                            catch
+                            {
+                                Console.WriteLine("Invalid hash size for " + line);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                Console.WriteLine("[!] No potfile not found or --potfile missing !");
+            }
+
+            var samePassword = new Dictionary<string, AssocPassHash>();
+            int nbCompromised = 0;
+            int nbCompromisedAndEnabled = 0;
+            int nbCompromisedAndEnabledAndAdmin = 0;
+            int nbCompromisedAndAdmin = 0;
             using (var file = new StreamWriter(usersCsvPath, false))
             {
-                file.WriteLine("Domain,Username,Administrator,Domain Admin,Enterprise Admin,Disabled,Expired,Password Never Expires,Password Not Required,Password Last Changed,Last Logon");
+                int i = 1;
+                file.WriteLine("Sid,Domain,Username,PasswordFound,IsAdminWithLowPassword,isAdminInAnyGroup,Administrator,Domain Admin,Enterprise Admin,Disabled,Expired,Password Never Expires,Password Not Required,Password Last Changed,Last Logon,Hash,Password,PasswordLen,MemberOf,Count in group");
                 foreach (var user in ntdsAudit.Users)
                 {
                     var domain = ntdsAudit.Domains.Single(x => x.Sid == user.DomainSid);
-                    file.WriteLine($"{domain.Fqdn},{user.SamAccountName},{user.RecursiveGroupSids.Contains(domain.AdministratorsSid)},{user.RecursiveGroupSids.Contains(domain.DomainAdminsSid)},{user.RecursiveGroupSids.Intersect(ntdsAudit.Domains.Select(x => x.EnterpriseAdminsSid)).Any()},{user.Disabled},{!user.Disabled && user.Expires.HasValue && user.Expires.Value < baseDateTime},{user.PasswordNeverExpires},{user.PasswordNotRequired},{user.PasswordLastChanged},{user.LastLogon}");
+                    string password;
+                    string hash = user.NtHash.ToLower();
+                    int passwordLen = -1;
+                    bool isAdmin = user.RecursiveGroupSids.Contains(domain.AdministratorsSid) || user.RecursiveGroupSids.Contains(domain.DomainAdminsSid) || user.RecursiveGroupSids.Intersect(ntdsAudit.Domains.Select(x => x.EnterpriseAdminsSid)).Any();
+                    try
+                    {
+                        password = hashAssoc[hash];
+                        passwordLen = password.Length;
+                        if (passwordLen == 0)
+                        {
+                            password = "<EMPTY>";
+                        }
+                        nbCompromised += 1;
+                        if( user.Disabled != true)
+                        {
+                            nbCompromisedAndEnabled += 1;
+                            if (isAdmin)
+                            {
+                                nbCompromisedAndEnabledAndAdmin += 1;
+                            }
+                        }
+                        if (isAdmin)
+                        {
+                            nbCompromisedAndAdmin += 1;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        password = "<NOT FOUND>";
+                        passwordLen = -1;
+                    }
+                    bool isAdminWithLowPassword = isAdmin && passwordLen > -1;
+                    bool isPasswordFound = passwordLen > -1;
+                    file.Write($"{user.DomainSid}-{user.Rid},{domain.Fqdn},{user.SamAccountName},{isPasswordFound},{isAdminWithLowPassword},{isAdmin},{user.RecursiveGroupSids.Contains(domain.AdministratorsSid)},{user.RecursiveGroupSids.Contains(domain.DomainAdminsSid)},{user.RecursiveGroupSids.Intersect(ntdsAudit.Domains.Select(x => x.EnterpriseAdminsSid)).Any()},{user.Disabled},{!user.Disabled && user.Expires.HasValue && user.Expires.Value < baseDateTime},{user.PasswordNeverExpires},{user.PasswordNotRequired},{user.PasswordLastChanged},{user.LastLogon},{user.LmHash}:{user.NtHash},\"{password}\",{passwordLen},\"");
+                    foreach (SecurityIdentifier si in user.RecursiveGroupSids)
+                    {
+                        try
+                        {
+                            file.Write(groupAssoc[si.ToString()] + " / ");
+                        }
+                        catch
+                        {
+                            file.Write($"<unk {si.ToString()}> / ");
+                        }
+                    }
+                    file.Write($"\",{user.RecursiveGroupSids.Length}\n");
+
+
+                    if ( !samePassword.ContainsKey(hash) ){
+                        samePassword.Add(hash, new AssocPassHash(hash, password, passwordLen));
+                    }
+                    samePassword[hash].count += 1;
+
+                    progress.Report((100 * i / nbUsers) / 100.0);
+                    ++i;
                 }
             }
+            
+            var stats = samePassword.OrderByDescending(x => x.Value.count);
+            using (var file = new StreamWriter(usersCsvPath.Replace(".csv",string.Empty)+ "-PasswordReuse.csv", false))
+            {
+                int i = 1;
+                file.WriteLine("Hash,Password,Count");
+                foreach (var h in stats)
+                {
+                    if(h.Value.count <= 1)
+                    {
+                        break;
+                    }
+                    file.WriteLine($"\"{h.Value.hash}\",\"{h.Value.pass.Replace("\"","\\\\\"")}\",{h.Value.count}");
+                }
+            }
+            using (var file = new StreamWriter(usersCsvPath.Replace(".csv", string.Empty) + "-Stats.csv", false))
+            {
+                int nbAccount = ntdsAudit.Users.Count();
+                var expiredUsersCount = ntdsAudit.Users.Count(x => !x.Disabled && x.Expires.HasValue && x.Expires.Value < baseDateTime);
+                var activeUsers = ntdsAudit.Users.Where(x => !x.Disabled && (!x.Expires.HasValue || x.Expires.Value > baseDateTime)).ToList();
+                var activeUsersCount = activeUsers.Count;
+                var activeUsersUnusedIn1Year = activeUsers.Count(x => x.LastLogon + TimeSpan.FromDays(365) < baseDateTime);
+                var activeUsersUnusedIn90Days = activeUsers.Count(x => x.LastLogon + TimeSpan.FromDays(90) < baseDateTime);
+                var activeUsersWithPasswordNotRequired = activeUsers.Count(x => x.PasswordNotRequired);
+                var activeUsersWithPasswordNeverExpires = activeUsers.Count(x => !x.PasswordNeverExpires);
+                var activeUsersPasswordUnchangedIn1Year = activeUsers.Count(x => x.PasswordLastChanged + TimeSpan.FromDays(365) < baseDateTime);
+                var activeUsersPasswordUnchangedIn90Days = activeUsers.Count(x => x.PasswordLastChanged + TimeSpan.FromDays(90) < baseDateTime);
+                file.WriteLine($"\"Number of account\",{nbAccount}");
+                file.WriteLine($"\"Active account (Enabled and not password not expired)\",{activeUsersCount}");
+                file.WriteLine(GetCSVStatistic("Disabled users", ntdsAudit.Users.Count(x => x.Disabled), nbAccount));
+                file.WriteLine(GetCSVStatistic("Expired users", expiredUsersCount, nbAccount));
+                file.WriteLine(GetCSVStatistic("Active users unused in 1 year", activeUsersUnusedIn1Year, activeUsersCount));
+                file.WriteLine(GetCSVStatistic("Active users unused in 90 days", activeUsersUnusedIn90Days, activeUsersCount));
+                file.WriteLine(GetCSVStatistic("Active users which do not require a password", activeUsersWithPasswordNotRequired, activeUsersCount));
+                file.WriteLine(GetCSVStatistic("Active users with non-expiring passwords", activeUsersWithPasswordNeverExpires, activeUsersCount));
+                file.WriteLine(GetCSVStatistic("Active users with password unchanged in 1 year", activeUsersPasswordUnchangedIn1Year, activeUsersCount));
+                file.WriteLine(GetCSVStatistic("Active users with password unchanged in 90 days", activeUsersPasswordUnchangedIn90Days, activeUsersCount));
+
+                foreach (var domain in ntdsAudit.Domains)
+                {
+                    var activeUsersWithAdministratorMembership = activeUsers.Where(x => x.RecursiveGroupSids.Contains(domain.AdministratorsSid)).ToArray();
+                    var activeUsersWithDomainAdminMembership = activeUsers.Where(x => x.RecursiveGroupSids.Contains(domain.DomainAdminsSid)).ToArray();
+                    // Unlike Domain Admins and Adminsitrators, Enterprise Admins is not domain local, so include all users.
+                    var activeUsersWithEnterpriseAdminMembership = ntdsAudit.Users.Where(x => !x.Disabled && (!x.Expires.HasValue || x.Expires.Value > baseDateTime) && x.RecursiveGroupSids.Contains(domain.EnterpriseAdminsSid)).ToArray();
+                    file.WriteLine(GetCSVStatistic($"Active users with Administrator rights (domain={domain.Name})", activeUsersWithAdministratorMembership.Length, activeUsersCount));
+                    file.WriteLine(GetCSVStatistic($"Active users with Domain Admin rights (domain={domain.Name})", activeUsersWithDomainAdminMembership.Length, activeUsersCount));
+                    file.WriteLine(GetCSVStatistic($"Active users with Enterprise Admin rights (domain={domain.Name})", activeUsersWithEnterpriseAdminMembership.Length, activeUsersCount));
+                }
+                file.WriteLine($"\"Number of compromised accounts\",\"{nbCompromised} ({nbCompromised*100/ nbAccount}%)\"");
+                file.WriteLine($"\"Number of compromised accounts with enabled flag\",\"{nbCompromisedAndEnabled} ({nbCompromisedAndEnabled * 100 / nbAccount}%)\"");
+                file.WriteLine($"\"Number of compromised accounts with admin priviledge\",\"{nbCompromisedAndAdmin} ({nbCompromisedAndAdmin * 100 / nbAccount}%)\"");
+                file.WriteLine($"\"Number of compromised accounts, enabled and admin\",\"{nbCompromisedAndEnabledAndAdmin} ({nbCompromisedAndEnabledAndAdmin * 100 / nbAccount}%)\"");
+                file.WriteLine(string.Empty);
+                for (int i = 0; i <= 30; ++i)
+                {
+                    file.WriteLine($"\"Passwword with a length of {i}\",{samePassword.Where(x => x.Value.len == i).Count()}");
+                }
+            }
+            progress.Report(1);
         }
     }
 }
